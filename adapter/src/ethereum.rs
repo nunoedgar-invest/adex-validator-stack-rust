@@ -126,22 +126,24 @@ impl EthereumAdapter {
 
     /// Checks if the `from` address has privilages,
     /// by using the Identity contract with a create2 address created with the `from` address
-    pub async fn has_privilages(
+    pub async fn has_privileges(
         &self,
         identity: Address,
-        check_for: Address,
+        _check_for: Address,
         hash: [u8; 32],
         signature: &[u8],
     ) -> Result<bool, Error> {
         // see https://eips.ethereum.org/EIPS/eip-1271
-        let magic_value: u32 = 0x1626ba7e;
-        // 0x4e487b710000000000000000000000000000000000000000000000000000000000000021
+        // 0x1626ba7e is in little endian
+        let magic_value: u32 = 2126128662;
+        // u32::MAX
+        let _no_access_value: u32 = 0xffffffff;
 
         let identity_contract =
             Contract::from_json(self.web3.eth(), H160(identity.to_bytes()), &IDENTITY_ABI)
                 .map_err(Error::ContractInitialization)?;
 
-        let status: u32 = identity_contract
+        let status: [u8; 4] = identity_contract
             .query(
                 "isValidSignature",
                 (
@@ -150,15 +152,17 @@ impl EthereumAdapter {
                     // bytes
                     Token::Bytes(signature.to_vec()),
                 ),
-                Some(H160(check_for.to_bytes())),
+                None,
                 Options::default(),
                 None,
             )
             .await
             .map_err(Error::ContractQuerying)?;
 
+        let actual_value = u32::from_le_bytes(status);
+
         // if it is the magical value then the address has privileges.
-        Ok(status == magic_value)
+        Ok(actual_value == magic_value)
     }
 }
 
@@ -233,7 +237,7 @@ impl Adapter for EthereumAdapter {
         }
 
         let parts: Vec<&str> = token.split('.').collect();
-        let (header_encoded, payload_encoded, token_encoded) =
+        let (header_encoded, payload_encoded, signature_encoded) =
             match (parts.get(0), parts.get(1), parts.get(2)) {
                 (Some(header_encoded), Some(payload_encoded), Some(token_encoded)) => {
                     (header_encoded, payload_encoded, token_encoded)
@@ -246,7 +250,7 @@ impl Adapter for EthereumAdapter {
                 }
             };
 
-        let verified = ewt_verify(header_encoded, payload_encoded, token_encoded)
+        let verified = ewt_verify(header_encoded, payload_encoded, signature_encoded)
             .map_err(Error::VerifyMessage)?;
 
         if self.whoami().to_checksum() != verified.payload.id {
@@ -258,13 +262,18 @@ impl Adapter for EthereumAdapter {
         let sess = match &verified.payload.identity {
             Some(identity) => {
                 let decoded_signature =
-                    base64::decode_config(token_encoded, base64::URL_SAFE_NO_PAD).unwrap();
-                    
-                let hash =
-                    hash_message(format!("{}.{}", header_encoded, payload_encoded).as_bytes());
+                    base64::decode_config(signature_encoded, base64::URL_SAFE_NO_PAD).unwrap();
+
+                let to_hash = format!("{}.{}", header_encoded, payload_encoded);
+
+                let mut hash: [u8; 32] = [0; 32];
+
+                let mut keccak256 = Keccak::new_keccak256();
+                keccak256.update(to_hash.as_bytes());
+                keccak256.finalize(&mut hash);
 
                 if self
-                    .has_privilages(
+                    .has_privileges(
                         identity.to_address(),
                         self.whoami().to_address(),
                         hash,
@@ -410,6 +419,8 @@ fn hash_message(message: &[u8]) -> [u8; 32] {
 // Ethereum Web Tokens
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Payload {
+    /// The intended Address for which the token is/should be created.
+    /// `0x` & checkesumed address
     pub id: String,
     pub era: i64,
     pub address: String,
@@ -452,31 +463,53 @@ pub fn ewt_sign(
     let message = Message::from(hash_message(
         format!("{}.{}", header_encoded, payload_encoded).as_bytes(),
     ));
-    let signature: Signature = signer
-        .sign(password, &message)
-        .map_err(EwtSigningError::SigningMessage)?
-        .into_electrum()
-        .into();
 
-    let token = base64::encode_config(
-        &hex::decode(format!("{}", signature)).map_err(EwtSigningError::DecodingHexSignature)?,
-        base64::URL_SAFE_NO_PAD,
-    );
+    let signature = {
+        let signature = signer
+            .sign(password, &message)
+            .map_err(EwtSigningError::SigningMessage)?
+            .into_electrum()
+            .to_vec();
 
-    Ok(format!("{}.{}.{}", header_encoded, payload_encoded, token))
+        let mut hex = hex::encode(signature);
+        hex.push_str("01");
+
+        // hex
+        hex::decode(hex).unwrap()
+    };
+
+    let signature_encoded = base64::encode_config(signature, base64::URL_SAFE_NO_PAD);
+
+    Ok(format!(
+        "{}.{}.{}",
+        header_encoded, payload_encoded, signature_encoded
+    ))
 }
 
 pub fn ewt_verify(
     header_encoded: &str,
     payload_encoded: &str,
-    token: &str,
+    signature_encoded: &str,
 ) -> Result<VerifyPayload, EwtVerifyError> {
     let message = Message::from(hash_message(
         format!("{}.{}", header_encoded, payload_encoded).as_bytes(),
     ));
 
-    let decoded_signature = base64::decode_config(&token, base64::URL_SAFE_NO_PAD)
+    let decoded_signature = base64::decode_config(&signature_encoded, base64::URL_SAFE_NO_PAD)
         .map_err(EwtVerifyError::SignatureDecoding)?;
+
+    // if it returns the same slice, then there was no suffix
+    let decoded_signature = match decoded_signature.strip_suffix("01".as_bytes()) {
+        Some(slice) => {
+            if slice == decoded_signature {
+                return Err(EwtVerifyError::InvalidSignature);
+            } else {
+                slice
+            }
+        }
+        None => return Err(EwtVerifyError::InvalidSignature),
+    };
+
     let signature = Signature::from_electrum(&decoded_signature);
     // signature is empty, so it is invalid, see `Signature::from_electrum`
     if *signature == [0; 65] {
@@ -508,16 +541,137 @@ mod test {
     use super::test_util::*;
     use super::*;
     use chrono::Utc;
-    use primitives::{
-        config::{DEVELOPMENT_CONFIG, GANACHE_CONFIG},
-        test_util::{CREATOR, IDS, LEADER},
-    };
+    use primitives::{ToETHChecksum, config::{DEVELOPMENT_CONFIG, GANACHE_CONFIG}, test_util::{ADDRESS_4, ADDRESS_5, CREATOR, IDS, LEADER}};
     use web3::{transports::Http, Web3};
 
     #[test]
     fn should_init_and_unlock_ethereum_adapter() {
         let mut eth_adapter = setup_eth_adapter(DEVELOPMENT_CONFIG.clone());
         eth_adapter.unlock().expect("should unlock eth adapter");
+    }
+
+    // fn keccak256<T: AsRef<[u8]>>(message: T) -> [u8; 32] {
+    //     let mut result = Keccak::new_keccak256();
+    //     result.update("\x19Ethereum Signed Message:\n".as_bytes());
+    //     // result.update(message.len());
+    //     result.update(message.as_ref());
+
+    //     let mut hash: [u8; 32] = [0; 32];
+    //     result.finalize(&mut hash);
+
+    //     hash
+    // }
+
+    // fn signMsg(wallet, hash) {
+    //     // assert.equal(hash.length, 32, 'hash must be 32byte array buffer')
+    //     // 01 is the enum number of EthSign signature type
+    //     return `${mapSignatureV(await wallet.signMessage(hash))}01`
+    // }
+
+    fn keccak256(input: &[u8]) -> [u8; 32] {
+            let mut result = Keccak::new_keccak256();
+            result.update(input);
+
+            let mut res: [u8; 32] = [0; 32];
+            result.finalize(&mut res);
+
+            res
+    }
+
+    #[tokio::test]
+    async fn test_signature_ffs() {
+        let msg_hash_actual = keccak256(&hex::decode("21851b").unwrap());
+
+        let msg_hash = "978d98785935b5526480e9ca00d01b063a6c56f51afbc4ad27b28daecb14258d";
+        let msg_hash_decoded = hex::decode(msg_hash).unwrap();
+        assert_eq!(msg_hash_decoded.len(), 32);
+        assert_eq!(&hex::encode(msg_hash_actual), msg_hash);
+        assert_eq!(&msg_hash_decoded, &msg_hash_actual);
+
+        let user = *ADDRESS_4;
+        let user_sig = "0x91b026e705ce9edaf4c4b35789b445a96a655e9655b568d282198ae1af5e99f473af26b456aed1891d99b27d134017c5cb4d9bda61b9c36d00da2d8668dbfeab1b01";
+
+        // let evil = *ADDRESS_5;
+        // let evil_sig = "0xd996fd5bec59476d4f064a3605f980b2ece96da51834b8fa9833a165dedf38a419fc9f974d0af0a690a7c46b8c2b21cbda07770832ffc191f96c2673ccd95ff51b01";
+
+        let mut user_adapter = EthereumAdapter::init(KEYSTORES[&user].clone(), &GANACHE_CONFIG)
+            .expect("should init ethereum adapter");
+        user_adapter.unlock().expect("should unlock eth adapter");
+        let wallet = user_adapter.wallet.clone().unwrap();
+
+        let signature_actual = {
+            // working for Bundle
+            // let ethers_sign_message = hash_message(msg_hash_actual.to_hex_prefixed().as_bytes());
+            // non working:
+            // let ethers_sign_message = keccak256(msg_hash_actual.to_hex_prefixed().as_bytes());
+            // let ethers_sign_message = msg_hash_actual;
+            let ethers_sign_message = hash_message(&msg_hash_actual);
+            let message = Message::from(ethers_sign_message);
+
+            let mut signature = wallet
+                .sign(&user_adapter.keystore_pwd, &message)
+                .map_err(EwtSigningError::SigningMessage)
+                .unwrap()
+                .into_electrum()
+                .to_vec();
+
+                signature.extend(hex::decode("01").unwrap());
+            // let mut hex = signature.to_hex();
+            // hex.push_str("01");
+
+            // hex::decode(hex).unwrap()
+            signature
+        };
+
+        // assert_eq!(user_sig, signature_actual.to_hex_prefixed());
+
+        let (identity_address, _contract) =
+            deploy_identity_contract(&user_adapter.web3, user, &[user])
+                .await
+                .expect("Should deploy identity");
+
+
+        let has_privileges = user_adapter
+            .has_privileges(identity_address, user, msg_hash_actual, &signature_actual)
+            .await
+            .expect("Should get privileges");
+
+        assert!(has_privileges, "Should have privileges!")
+
+    }
+
+    #[tokio::test]
+    async fn test_new_verify() {
+        let msg_hash = hash_message("0x21851b".as_bytes());
+        let user_acc = *ADDRESS_4;
+        let _evil_acc = *ADDRESS_5;
+
+        let mut user_adapter = EthereumAdapter::init(KEYSTORES[&user_acc].clone(), &GANACHE_CONFIG)
+            .expect("should init ethereum adapter");
+        user_adapter.unlock().expect("should unlock eth adapter");
+        let wallet = user_adapter.wallet.clone().unwrap();
+
+        let message = Message::from(msg_hash);
+        let wallet_sign = wallet
+            .sign(&user_adapter.keystore_pwd, &message)
+            .expect("Sign");
+        let signature = wallet_sign.into_electrum();
+        let mut eth_signature = hex::encode(signature);
+        eth_signature.push_str("01");
+        let eth_signature = hex::decode(eth_signature).unwrap();
+
+        let (identity_address, _contract) =
+            deploy_identity_contract(&user_adapter.web3, user_acc, &[user_acc])
+                .await
+                .expect("Should deploy identity");
+        // let identity_id = ValidatorId::from(identity_address);
+
+        let has_privileges = user_adapter
+            .has_privileges(identity_address, user_acc, msg_hash, &eth_signature)
+            .await
+            .expect("Should get privileges");
+
+        assert!(has_privileges);
     }
 
     #[test]
@@ -604,9 +758,81 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_session_from_token() {
-        use primitives::ToETHChecksum;
+    async fn test_has_privileges() {
+        let mut adapter = EthereumAdapter::init(KEYSTORES[&LEADER].clone(), &GANACHE_CONFIG)
+            .expect("should init ethereum adapter");
+        adapter.unlock().expect("should unlock eth adapter");
 
+        let whoami = adapter.whoami().to_address();
+        assert_eq!(
+            *LEADER, whoami,
+            "Ethereum address should be authenticated with keystore file as LEADER!"
+        );
+
+        let (identity_address, contract) =
+            deploy_identity_contract(&adapter.web3, *CREATOR, &[whoami])
+                .await
+                .expect("Should deploy identity");
+        let identity_id = ValidatorId::from(identity_address);
+
+        let set_privileges: [u8; 32] = contract
+            .query(
+                "privileges",
+                Token::Address(H160(whoami.to_bytes())),
+                None,
+                Options::default(),
+                None,
+            )
+            .await
+            .expect("should query contract privileges");
+
+        let expected_privileges = {
+            let mut bytes32 = [0_u8; 32];
+            bytes32[31] = 1;
+            bytes32
+        };
+        assert_eq!(
+            expected_privileges, set_privileges,
+            "The Privilege set through constructor should be `1`"
+        );
+
+        let wallet = adapter.wallet.clone().expect("Should have unlocked wallet");
+
+        let era = Utc::now().timestamp_millis() as f64 / 60000.0;
+        let payload = Payload {
+            id: adapter.whoami().to_checksum(),
+            era: era.floor() as i64,
+            address: adapter.whoami().to_checksum(),
+            identity: Some(identity_id),
+        };
+
+        let auth_token = ewt_sign(&wallet, &adapter.keystore_pwd, &payload)
+            .expect("Sould successfully sign the Paypload");
+
+        let parts = auth_token.split('.').collect::<Vec<_>>();
+        let (header_encoded, payload_encoded, signature_encoded) = (parts[0], parts[1], parts[2]);
+        dbg!(header_encoded, payload_encoded, signature_encoded);
+
+        let decoded_signature =
+            base64::decode_config(signature_encoded, base64::URL_SAFE_NO_PAD).unwrap();
+
+        let hash = hash_message(format!("{}.{}", header_encoded, payload_encoded).as_bytes());
+
+        let has_privileges = adapter
+            .has_privileges(
+                identity_address,
+                adapter.whoami().to_address(),
+                hash,
+                &decoded_signature,
+            )
+            .await
+            .expect("Should get privileges");
+
+        assert!(has_privileges);
+    }
+
+    #[tokio::test]
+    async fn test_session_from_token() {
         // let identity = ValidatorId::try_from("0x5B04DBc513F90CaAFAa09307Ad5e3C65EB4b26F0").unwrap();
 
         // let mut eth_adapter = setup_eth_adapter(GANACHE_CONFIG.clone());
@@ -617,7 +843,6 @@ mod test {
 
         let whoami = adapter.whoami().to_address();
 
-        // todo: Deploy Identity
         let (identity_address, _contract) =
             deploy_identity_contract(&adapter.web3, adapter.whoami().to_address(), &[whoami])
                 .await
@@ -639,7 +864,7 @@ mod test {
         // let parts = token.split('.').collect::<Vec<_>>();
 
         // double check that we have access for _Who Am I_
-        // eth_adapter.has_privilages(identity_address, whoami, ).await.expect("Ok");
+        // eth_adapter.has_privileges(identity_address, whoami, ).await.expect("Ok");
 
         let session: Session = adapter.session_from_token(&token).await.unwrap();
 
